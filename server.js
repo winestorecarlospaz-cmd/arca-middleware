@@ -25,12 +25,17 @@ const KEY_PATH = process.env.KEY_PATH || "./certs/privada.key";
 const PTO_VTA_DEFAULT = Number(process.env.PTO_VTA_DEFAULT || 1);
 
 function auth(req, res, next) {
-  const key = req.header("x-api-key") || "";
+  const key =
+    req.header("x-api-key") ||
+    req.header("X-POS-Secret") ||
+    (req.header("Authorization") || "").replace(/^Bearer\s+/i, "");
+
   if (!API_KEY || key !== API_KEY) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+    return res.status(401).json({ ok: false, success: false, error: "Unauthorized" });
   }
   next();
 }
+
 
 function readCerts() {
   const cert = fs.readFileSync(path.resolve(CERT_PATH), "utf8");
@@ -313,6 +318,113 @@ app.post("/facturar-test", auth, async (req, res) => {
     return res.status(400).json({
       ok: false,
       error: err.message || "Error al facturar",
+      detail: err.err || err.response || String(err),
+    });
+  }
+});
+
+/**
+ * Contrato para Google Apps Script (arca.gs)
+ * POST /api/arca/wsfe/emitir
+ */
+app.post("/api/arca/wsfe/emitir", auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const comp = body.comprobante || {};
+    const imp = comp.importes || {};
+    const doc = comp.documentoReceptor || {};
+    const emisor = body.emisor || {};
+    const moneda = comp.moneda || {};
+
+    // Mapear el JSON de Apps Script al formato que ya usa buildVoucherPayload
+    const mapped = {
+      tipoComprobante: Number(comp.tipo || 6),
+      cbteTipo: Number(comp.tipo || 6),
+      ptoVta: Number(emisor.puntoVenta || body.puntoVenta || PTO_VTA_DEFAULT),
+      concept: Number(comp.concepto || 1),
+      cbteFch: comp.fecha ? Number(comp.fecha) : undefined,
+      receptor: {
+        docTipo: Number(doc.tipo || 99),
+        docNro: doc.numero != null ? Number(doc.numero) : 0,
+        condicionIvaId: Number(comp.condicionIvaReceptor || 5),
+      },
+      condicionIvaReceptorId: Number(comp.condicionIvaReceptor || 5),
+      impNeto: round2(imp.neto),
+      impIVA: round2(imp.iva),
+      impTotal: round2(imp.total),
+      impOpEx: round2(imp.exento || 0),
+      impTotConc: round2(imp.noGravado || 0),
+      impTrib: round2(imp.tributos || 0),
+      // arca.gs manda: [{ id, baseImponible, importe }]
+      ivaArray: Array.isArray(comp.iva)
+        ? comp.iva.map((x) => ({
+            Id: Number(x.id ?? x.Id),
+            BaseImp: round2(x.baseImponible ?? x.BaseImp ?? 0),
+            Importe: round2(x.importe ?? x.Importe ?? 0),
+          }))
+        : [],
+    };
+
+    const afip = getAfip();
+    const { payload, ptoVta, cbteTipo } = buildVoucherPayload(mapped);
+
+    // Si Apps Script manda moneda, respetarla
+    if (moneda.id) payload.MonId = String(moneda.id);
+    if (moneda.cotizacion != null) payload.MonCotiz = Number(moneda.cotizacion) || 1;
+
+    const last = await afip.ElectronicBilling.getLastVoucher(ptoVta, cbteTipo);
+    const next = Number(last || 0) + 1;
+    payload.CbteDesde = next;
+    payload.CbteHasta = next;
+
+    const result = await afip.ElectronicBilling.createVoucher(payload);
+
+    const cae = result.CAE || result.cae || null;
+    const caeVto = result.CAEFchVto || result.caeFchVto || null;
+
+    // Respuesta en el formato que espera facturarVentaArca (arca.gs)
+    if (cae) {
+      return res.status(200).json({
+        success: true,
+        resultado: "A",
+        cae: String(cae),
+        vencimientoCae: String(caeVto || ""),
+        numeroComprobante: next,
+        puntoVenta: ptoVta,
+        tipoComprobante: cbteTipo,
+        observaciones: [],
+        errores: [],
+        // compat
+        ok: true,
+        cbteNro: next,
+        afipResult: result,
+      });
+    }
+
+    return res.status(200).json({
+      success: false,
+      resultado: "R",
+      message: "ARCA no devolvió CAE",
+      errores: [{ codigo: "SIN_CAE", mensaje: "Respuesta sin CAE" }],
+      observaciones: [],
+      ok: false,
+      afipResult: result,
+      requestPayload: payload,
+    });
+  } catch (err) {
+    console.error("Error /api/arca/wsfe/emitir:", err);
+    return res.status(400).json({
+      success: false,
+      resultado: "R",
+      message: err.message || "Error al facturar",
+      error: err.message || "Error al facturar",
+      errores: [
+        {
+          codigo: "MIDDLEWARE",
+          mensaje: err.message || "Error al facturar",
+        },
+      ],
+      ok: false,
       detail: err.err || err.response || String(err),
     });
   }
